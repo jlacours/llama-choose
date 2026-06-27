@@ -1,10 +1,13 @@
 [package]
 name = "llama-choose"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pick, launch, and benchmark local llama.cpp models"
+repository = "https://github.com/jlacours/llama-choose"
 
 [dependencies]
-rusqlite = { workspace = true }
-ratatui = { workspace = true }
-serde_json = { workspace = true }
-walkdir = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+ratatui = "0.29"
+serde_json = "1"
+walkdir = "2"

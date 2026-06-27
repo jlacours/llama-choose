@@ -14,7 +14,10 @@ use std::process::{Command, Stdio};
 use crate::config::Model;
 use crate::db;
 
-const UI_CONFIG_FILE: &str = "/home/juju/.config/llama.cpp/ui-config.json";
+fn ui_config_file() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    format!("{home}/.config/llama.cpp/ui-config.json")
+}
 
 /// Resolve a llama.cpp binary: prefer the home repo build (which is not on
 /// PATH; its RPATH already covers the sibling shared libs), fall back to the
@@ -68,7 +71,7 @@ pub fn build_server_command(model: &Model, host: &str, port: u16, parallel: u32)
         "--ui".into(),
         "--ui-mcp-proxy".into(),
         "--ui-config-file".into(),
-        UI_CONFIG_FILE.into(),
+        ui_config_file(),
     ]);
     cmd
 }
@@ -88,7 +91,7 @@ pub fn build_router_command(ini_path: &str, host: &str, port: u16, parallel: u32
         "--ui".into(),
         "--ui-mcp-proxy".into(),
         "--ui-config-file".into(),
-        UI_CONFIG_FILE.into(),
+        ui_config_file(),
         "--parallel".into(),
         parallel.to_string(),
     ]
@@ -182,6 +185,24 @@ fn parse_timing_line(line: &str) -> Option<(&'static str, f64, i64)> {
     Some((kind, tok_per_s, n_tokens))
 }
 
+/// Whether a scraped timing sample is worth recording.
+///
+/// When a generation produces a single token, llama.cpp's eval time rounds to
+/// `0.00 ms` and it prints a sentinel `1000000.00 tokens per second` — a
+/// divide-by-near-zero artifact, not a real measurement. A one-token generation
+/// has no meaningful throughput anyway, so we drop it; otherwise it blows the
+/// average to the moon (a MoE that interleaves short reasoning turns will emit
+/// these constantly). Prompt-eval samples are always kept.
+fn is_meaningful_sample(kind: &str, tok_per_s: f64, n_tokens: i64) -> bool {
+    if !tok_per_s.is_finite() || tok_per_s <= 0.0 {
+        return false;
+    }
+    if kind == "tg" && n_tokens < 2 {
+        return false;
+    }
+    true
+}
+
 /// Spawn a server command, echo its stderr through to our own stderr, and
 /// scrape timing lines into the stats DB under `alias`. Returns the exit code.
 pub fn run_with_scrape(cmd: &[String], alias: &str) -> i32 {
@@ -219,7 +240,9 @@ pub fn run_with_scrape(cmd: &[String], alias: &str) -> i32 {
             let _ = writeln!(h, "{line}");
         }
         if let (Some(conn), Some((kind, tps, n))) = (&sample_conn, parse_timing_line(&line)) {
-            let _ = db::insert_sample(conn, alias, kind, tps, n);
+            if is_meaningful_sample(kind, tps, n) {
+                let _ = db::insert_sample(conn, alias, kind, tps, n);
+            }
         }
     }
 
@@ -265,15 +288,27 @@ mod tests {
     }
 
     #[test]
+    fn drops_single_token_generation_sentinel() {
+        // llama.cpp's 1-token divide-by-zero artifact must not be recorded.
+        assert!(!is_meaningful_sample("tg", 1_000_000.0, 1));
+        assert!(!is_meaningful_sample("tg", 42.0, 1));
+        // Real generation and any prompt-eval sample are kept.
+        assert!(is_meaningful_sample("tg", 50.0, 100));
+        assert!(is_meaningful_sample("pp", 30.0, 4));
+    }
+
+    #[test]
     fn scrapes_fake_server_stderr_into_db() {
         // Isolate the stats DB under a throwaway HOME.
         let tmp = std::env::temp_dir().join(format!("llama-choose-test-{}", std::process::id()));
         std::env::set_var("HOME", &tmp);
         let alias = "fake-model";
 
-        // A stand-in server: emit one generation + one prompt timing line, then exit.
+        // A stand-in server: emit one real generation, one single-token sentinel
+        // (which must be dropped), and one prompt timing line, then exit.
         let script = "printf 'srv: starting\\n' >&2; \
             printf '       eval time =    2000.00 ms /   100 tokens (   20.00 ms per token,    50.00 tokens per second)\\n' >&2; \
+            printf '       eval time =       0.00 ms /     1 tokens (    0.00 ms per token, 1000000.00 tokens per second)\\n' >&2; \
             printf 'prompt eval time =     500.00 ms /    50 tokens (   10.00 ms per token,   100.00 tokens per second)\\n' >&2";
         let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
 
@@ -282,7 +317,7 @@ mod tests {
 
         let conn = db::open().expect("open stats db");
         let s = db::stats_for(&conn, alias).expect("stats");
-        assert_eq!(s.tg_n, 1, "one generation sample");
+        assert_eq!(s.tg_n, 1, "sentinel dropped, only the real generation kept");
         assert!((s.tg_avg.unwrap() - 50.0).abs() < 1e-6);
         assert_eq!(s.pp_n, 1, "one prompt sample");
         assert!((s.pp_avg.unwrap() - 100.0).abs() < 1e-6);
