@@ -7,12 +7,16 @@
 use std::io;
 
 use crate::meta::truncate;
+use crate::score::Scores;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Sparkline, Wrap},
+    widgets::{
+        Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Sparkline, Table,
+        TableState, Wrap,
+    },
     DefaultTerminal, Frame,
 };
 
@@ -39,6 +43,7 @@ pub struct ModelView {
     pub pp_n: u64,
     pub chat_score: Option<f64>,
     pub code_score: Option<f64>,
+    pub scores: Scores,
     pub spark: Vec<u64>,
 }
 
@@ -60,6 +65,20 @@ fn fmt_speed(v: Option<f64>) -> String {
 fn fmt_score(v: Option<f64>) -> String {
     v.map(|x| format!("{x:.0}/100"))
         .unwrap_or_else(|| "not run".into())
+}
+
+/// Bare 0–100 points, `—` when the underlying data does not exist yet.
+pub fn fmt_pts(v: Option<f64>) -> String {
+    v.map(|x| format!("{x:.0}")).unwrap_or_else(|| "—".into())
+}
+
+fn score_color(v: Option<f64>) -> Color {
+    match v {
+        None => Color::DarkGray,
+        Some(s) if s < 40.0 => Color::Red,
+        Some(s) if s < 70.0 => Color::Yellow,
+        Some(_) => Color::Green,
+    }
 }
 
 /// Average of whichever benchmark scores exist, if any.
@@ -117,6 +136,17 @@ pub fn verdict(m: &ModelView) -> (String, Color) {
 
 /// Move a list selection with wraparound.
 fn step(state: &mut ListState, len: usize, delta: isize) {
+    if len == 0 {
+        return;
+    }
+    let cur = state.selected().unwrap_or(0) as isize;
+    let next = (cur + delta).rem_euclid(len as isize) as usize;
+    state.select(Some(next));
+}
+
+/// Same wraparound move as `step`, but for `TableState` — `List` and `Table`
+/// don't share a common state trait, so this stays a near-duplicate.
+fn step_table(state: &mut TableState, len: usize, delta: isize) {
     if len == 0 {
         return;
     }
@@ -263,6 +293,10 @@ fn draw_model(f: &mut Frame, models: &[ModelView], state: &mut ListState) {
                     format!("{:>4} t/s", fmt_speed(m.tg_avg)),
                     Style::default().fg(speed_color(m.tg_avg)),
                 ),
+                Span::styled(
+                    format!(" {:>4}", fmt_pts(m.scores.overall)),
+                    Style::default().fg(score_color(m.scores.overall)).bold(),
+                ),
             ]))
         })
         .collect();
@@ -299,6 +333,180 @@ fn draw_model(f: &mut Frame, models: &[ModelView], state: &mut ListState) {
         )),
         outer[1],
     );
+}
+
+/// Column widths for the stats table, in header order. `VERDICT` is the only
+/// `Min` so it soaks up whatever width the fixed columns leave behind.
+const STATS_WIDTHS: [Constraint; 15] = [
+    Constraint::Length(24), // MODEL
+    Constraint::Length(4),  // SRC
+    Constraint::Length(4),  // RUNS
+    Constraint::Length(9),  // LAST
+    Constraint::Length(7),  // GEN t/s
+    Constraint::Length(6),  // PP t/s
+    Constraint::Length(4),  // CHAT
+    Constraint::Length(4),  // CODE
+    Constraint::Length(3),  // OUT
+    Constraint::Length(3),  // IN
+    Constraint::Length(3),  // IQ
+    Constraint::Length(3),  // USE
+    Constraint::Length(3),  // ALL
+    Constraint::Length(8),  // SIZE
+    Constraint::Min(20),    // VERDICT
+];
+
+/// Full-screen stats & scores dashboard — every model ranked the same way
+/// `llama-choose stats` ranks them on the CLI, just browsable without leaving
+/// the TUI (and without re-running the picker to see it).
+pub fn show_stats(term: &mut DefaultTerminal, models: &[ModelView]) -> io::Result<()> {
+    // Same ordering as `cmd_stats`: best overall first, scoreless/flunking
+    // models sink to the bottom as cull bait.
+    let mut sorted: Vec<&ModelView> = models.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.scores
+            .overall
+            .unwrap_or(-1.0)
+            .total_cmp(&a.scores.overall.unwrap_or(-1.0))
+            .then_with(|| b.launches.cmp(&a.launches))
+            .then_with(|| a.alias.cmp(&b.alias))
+    });
+
+    let mut state = TableState::default();
+    if !sorted.is_empty() {
+        state.select(Some(0));
+    }
+
+    loop {
+        term.draw(|f| draw_stats(f, &sorted, &mut state))?;
+
+        if let Event::Key(k) = event::read()? {
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            match k.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('j') | KeyCode::Down => step_table(&mut state, sorted.len(), 1),
+                KeyCode::Char('k') | KeyCode::Up => step_table(&mut state, sorted.len(), -1),
+                KeyCode::Char('g') | KeyCode::Home => state.select(Some(0)),
+                KeyCode::Char('G') | KeyCode::End => {
+                    state.select(Some(sorted.len().saturating_sub(1)))
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn draw_stats(f: &mut Frame, models: &[&ModelView], state: &mut TableState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(f.area());
+
+    let header = Row::new(
+        [
+            "MODEL", "SRC", "RUNS", "LAST", "GEN t/s", "PP t/s", "CHAT", "CODE", "OUT", "IN", "IQ",
+            "USE", "ALL", "SIZE", "VERDICT",
+        ]
+        .map(|h| Cell::from(Span::styled(h, Style::default().fg(ACCENT).bold()))),
+    );
+
+    let rows: Vec<Row> = models.iter().copied().map(stats_row).collect();
+
+    let table = Table::new(rows, STATS_WIDTHS)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(Span::styled(
+            " stats — all models ",
+            Style::default().fg(ACCENT).bold(),
+        )))
+        .row_highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .bg(Color::Rgb(40, 40, 50)),
+        )
+        .highlight_symbol("▌ ");
+    f.render_stateful_widget(table, chunks[0], state);
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            " j/k move · g/G top/bottom · q/Esc back ",
+            Style::default().fg(Color::DarkGray),
+        )),
+        chunks[1],
+    );
+}
+
+/// Right-align a plain styled value inside its cell — used for every numeric
+/// column so the table reads like the CLI's `cmd_stats` table.
+fn rcell(text: String, style: Style) -> Cell<'static> {
+    Cell::from(Line::from(Span::styled(text, style)).alignment(Alignment::Right))
+}
+
+fn stats_row(m: &ModelView) -> Row<'static> {
+    let name_style = if m.missing {
+        Style::default().fg(Color::Red).add_modifier(Modifier::DIM)
+    } else if m.launches == 0 {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+
+    // One decimal for gen t/s, matching `cmd_stats`; PP stays whole numbers.
+    let gen = m
+        .tg_avg
+        .map(|x| format!("{x:.1}"))
+        .unwrap_or_else(|| "—".into());
+    let pp = m
+        .pp_avg
+        .map(|x| format!("{x:.0}"))
+        .unwrap_or_else(|| "—".into());
+
+    let size = if m.missing {
+        Span::styled("MISSING", Style::default().fg(Color::Red))
+    } else {
+        Span::raw(m.size.clone())
+    };
+
+    let (verdict_text, verdict_color) = verdict(m);
+
+    Row::new(vec![
+        Cell::from(Span::styled(truncate(&m.alias, 24), name_style)),
+        Cell::from(if m.configured { "INI" } else { "disk" }),
+        rcell(m.launches.to_string(), Style::default().fg(Color::DarkGray)),
+        Cell::from(Span::styled(
+            m.last_used.clone(),
+            Style::default().fg(Color::DarkGray),
+        )),
+        rcell(gen, Style::default().fg(speed_color(m.tg_avg))),
+        rcell(pp, Style::default()),
+        rcell(fmt_pts(m.chat_score), Style::default()),
+        rcell(fmt_pts(m.code_score), Style::default()),
+        rcell(
+            fmt_pts(m.scores.output),
+            Style::default().fg(score_color(m.scores.output)),
+        ),
+        rcell(
+            fmt_pts(m.scores.input),
+            Style::default().fg(score_color(m.scores.input)),
+        ),
+        rcell(
+            fmt_pts(m.scores.intelligence),
+            Style::default().fg(score_color(m.scores.intelligence)),
+        ),
+        rcell(
+            fmt_pts(m.scores.usage),
+            Style::default().fg(score_color(m.scores.usage)),
+        ),
+        rcell(
+            fmt_pts(m.scores.overall),
+            Style::default().fg(score_color(m.scores.overall)).bold(),
+        ),
+        Cell::from(size),
+        Cell::from(Span::styled(
+            verdict_text,
+            Style::default().fg(verdict_color),
+        )),
+    ])
 }
 
 fn kv(label: &str, value: impl Into<String>) -> Line<'static> {
@@ -394,6 +602,42 @@ fn detail_paragraph(m: &ModelView) -> Paragraph<'static> {
     lines.push(kv("Prompt speed", prompt));
     lines.push(kv("Chat score", fmt_score(m.chat_score)));
     lines.push(kv("Code score", fmt_score(m.code_score)));
+    lines.push(Line::raw(""));
+
+    let mut score_line: Vec<Span> = vec![Span::styled(
+        format!("{:<13}", "Scores"),
+        Style::default().fg(Color::DarkGray),
+    )];
+    let components = [
+        ("output", m.scores.output),
+        ("input", m.scores.input),
+        ("intel", m.scores.intelligence),
+        ("usage", m.scores.usage),
+    ];
+    for (i, (label, val)) in components.into_iter().enumerate() {
+        if i > 0 {
+            score_line.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        score_line.push(Span::styled(
+            format!("{label} "),
+            Style::default().fg(Color::DarkGray),
+        ));
+        score_line.push(Span::styled(
+            fmt_pts(val),
+            Style::default().fg(score_color(val)),
+        ));
+    }
+    lines.push(Line::from(score_line));
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:<13}", "Overall"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            fmt_score(m.scores.overall),
+            Style::default().fg(score_color(m.scores.overall)).bold(),
+        ),
+    ]));
     lines.push(Line::raw(""));
 
     let (text, color) = verdict(m);

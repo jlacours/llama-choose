@@ -18,6 +18,7 @@ mod config;
 mod db;
 mod launch;
 mod meta;
+mod score;
 mod tui;
 
 use std::process::Command;
@@ -166,7 +167,7 @@ fn zero_stats() -> db::ModelStats {
 
 fn build_views(models: &[Model], conn: Option<&Connection>) -> Vec<ModelView> {
     let now = db::now();
-    models
+    let mut views: Vec<ModelView> = models
         .iter()
         .map(|m| {
             let path = m.model_path();
@@ -216,10 +217,26 @@ fn build_views(models: &[Model], conn: Option<&Connection>) -> Vec<ModelView> {
                 pp_n: s.pp_n,
                 chat_score: benchmark.chat,
                 code_score: benchmark.code,
+                scores: score::Scores::default(),
                 spark,
             }
         })
-        .collect()
+        .collect();
+
+    // The usage score is relative to the busiest model, so scores can only be
+    // filled in once every launch count is known.
+    let fleet_max_launches = views.iter().map(|v| v.launches).max().unwrap_or(0);
+    for v in &mut views {
+        v.scores = score::compute(
+            v.tg_avg,
+            v.pp_avg,
+            v.chat_score,
+            v.code_score,
+            v.launches,
+            fleet_max_launches,
+        );
+    }
+    views
 }
 
 fn load_models() -> Result<Vec<Model>, String> {
@@ -315,31 +332,43 @@ fn run_tui(
             "Start llama-server on Tailscale for 2 users".to_string(),
         ),
         ("cli".to_string(), "Start interactive llama-cli".to_string()),
+        (
+            "stats".to_string(),
+            "Full-screen stats & scores dashboard".to_string(),
+        ),
     ];
 
-    let Some(ai) = tui::pick_action(term, "llama-choose — action", &actions)? else {
-        return Ok(Decision::Quit);
-    };
-    let mode = actions[ai].0.clone();
+    // Looped so "stats" can pop up the dashboard and drop the user right back
+    // at the action menu instead of ending the picker session.
+    loop {
+        let Some(ai) = tui::pick_action(term, "llama-choose — action", &actions)? else {
+            return Ok(Decision::Quit);
+        };
+        let mode = actions[ai].0.clone();
 
-    match mode.as_str() {
-        "router" => Ok(Decision::Router),
-        "vllm" => {
-            let items: Vec<(String, String)> = VLLM_MODELS
-                .iter()
-                .map(|(k, d)| (k.to_string(), d.to_string()))
-                .collect();
-            Ok(match tui::pick_action(term, "vLLM model", &items)? {
-                Some(i) => Decision::Vllm(i),
-                None => Decision::Quit,
-            })
-        }
-        _ => {
-            // server / phone / shared / cli all pick a single GGUF model.
-            Ok(match tui::pick_model(term, views)? {
-                Some(index) => Decision::Launch { mode, index },
-                None => Decision::Quit,
-            })
+        match mode.as_str() {
+            "stats" => {
+                tui::show_stats(term, views)?;
+                continue;
+            }
+            "router" => return Ok(Decision::Router),
+            "vllm" => {
+                let items: Vec<(String, String)> = VLLM_MODELS
+                    .iter()
+                    .map(|(k, d)| (k.to_string(), d.to_string()))
+                    .collect();
+                return Ok(match tui::pick_action(term, "vLLM model", &items)? {
+                    Some(i) => Decision::Vllm(i),
+                    None => Decision::Quit,
+                });
+            }
+            _ => {
+                // server / phone / shared / cli all pick a single GGUF model.
+                return Ok(match tui::pick_model(term, views)? {
+                    Some(index) => Decision::Launch { mode, index },
+                    None => Decision::Quit,
+                });
+            }
         }
     }
 }
@@ -533,22 +562,43 @@ fn cmd_stats() -> i32 {
     };
 
     let mut views = build_views(&models, Some(&conn));
-    // Most-used first; never-launched models sink to the bottom as cull bait.
+    // Best overall score first; scoreless and flunking models sink to the
+    // bottom as cull bait.
     views.sort_by(|a, b| {
-        b.launches
-            .cmp(&a.launches)
+        b.scores
+            .overall
+            .unwrap_or(-1.0)
+            .total_cmp(&a.scores.overall.unwrap_or(-1.0))
+            .then_with(|| b.launches.cmp(&a.launches))
             .then_with(|| a.alias.cmp(&b.alias))
     });
 
     println!(
-        "{:<24} {:<6} {:>5}  {:<9} {:>9}  {:>5} {:>5} {:>5}  {:<8}  VERDICT",
-        "MODEL", "SOURCE", "RUNS", "LAST", "GEN t/s", "n", "CHAT", "CODE", "SIZE"
+        "{:<24} {:<6} {:>5}  {:<9} {:>8} {:>8}  {:>4} {:>4}  {:>3} {:>3} {:>3} {:>3} {:>3}  {:<8}  VERDICT",
+        "MODEL",
+        "SOURCE",
+        "RUNS",
+        "LAST",
+        "GEN t/s",
+        "PP t/s",
+        "CHAT",
+        "CODE",
+        "OUT",
+        "IN",
+        "IQ",
+        "USE",
+        "ALL",
+        "SIZE"
     );
-    println!("{}", "─".repeat(100));
+    println!("{}", "─".repeat(126));
     for v in &views {
         let gen = v
             .tg_avg
             .map(|x| format!("{x:.1}"))
+            .unwrap_or_else(|| "—".into());
+        let pp = v
+            .pp_avg
+            .map(|x| format!("{x:.0}"))
             .unwrap_or_else(|| "—".into());
         let (verdict, _) = tui::verdict(v);
         let size = if v.missing {
@@ -557,19 +607,20 @@ fn cmd_stats() -> i32 {
             v.size.clone()
         };
         println!(
-            "{:<24} {:<6} {:>5}  {:<9} {:>9}  {:>5} {:>5} {:>5}  {:<8}  {}",
+            "{:<24} {:<6} {:>5}  {:<9} {:>8} {:>8}  {:>4} {:>4}  {:>3} {:>3} {:>3} {:>3} {:>3}  {:<8}  {}",
             meta::truncate(&v.alias, 24),
             if v.configured { "INI" } else { "disk" },
             v.launches,
             v.last_used,
             gen,
-            v.tg_n,
-            v.chat_score
-                .map(|x| format!("{x:.0}"))
-                .unwrap_or_else(|| "—".into()),
-            v.code_score
-                .map(|x| format!("{x:.0}"))
-                .unwrap_or_else(|| "—".into()),
+            pp,
+            tui::fmt_pts(v.chat_score),
+            tui::fmt_pts(v.code_score),
+            tui::fmt_pts(v.scores.output),
+            tui::fmt_pts(v.scores.input),
+            tui::fmt_pts(v.scores.intelligence),
+            tui::fmt_pts(v.scores.usage),
+            tui::fmt_pts(v.scores.overall),
             size,
             verdict
         );
