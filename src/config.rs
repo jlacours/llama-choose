@@ -146,6 +146,8 @@ fn is_standalone_gguf(path: &Path) -> bool {
         && !lower.contains("mmproj")
         && !lower.starts_with("mtp-")
         && !lower.ends_with("-mtp.gguf")
+        && !lower.starts_with("imatrix")
+        && !lower.starts_with("dflash-")
         && shard_number(&lower).is_none_or(|n| n == 1)
 }
 
@@ -246,6 +248,8 @@ mod tests {
         std::fs::write(root.join("mmproj-model-Q8_0.gguf"), b"projector").unwrap();
         std::fs::write(root.join("mtp-some-model.gguf"), b"drafter").unwrap();
         std::fs::write(root.join("some-model-Q4_0-MTP.gguf"), b"drafter").unwrap();
+        std::fs::write(root.join("imatrix_unsloth.gguf"), b"calibration").unwrap();
+        std::fs::write(root.join("dflash-some-model.gguf"), b"drafter").unwrap();
         std::fs::write(root.join("split-00001-of-00002.gguf"), b"first").unwrap();
         std::fs::write(root.join("split-00002-of-00002.gguf"), b"second").unwrap();
         std::fs::create_dir_all(root.join(".cache")).unwrap();
@@ -285,6 +289,8 @@ mod tests {
             .iter()
             .any(|m| m.alias == "split-00001-of-00002" && !m.configured));
         assert!(!merged.iter().any(|m| m.alias.contains("mmproj")));
+        assert!(!merged.iter().any(|m| m.alias.starts_with("imatrix")));
+        assert!(!merged.iter().any(|m| m.alias.starts_with("dflash-")));
         assert!(!merged
             .iter()
             .any(|m| m.alias.to_ascii_lowercase().contains("mtp")));

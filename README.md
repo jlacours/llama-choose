@@ -21,7 +21,9 @@ Models are read from `~/.local/share/llama-models.ini`. The optional llama.cpp w
 
 ```bash
 llama-choose                        # interactive picker
-llama-choose launch ALIAS server    # launch one model
+llama-choose launch ALIAS tools     # launch one model with built-in tools
+llama-choose launch ALIAS server    # launch one model without built-in tools
+llama-choose check [ALIAS]          # validate model headers and split files
 llama-choose stats                  # usage and throughput
 llama-choose bench ALIAS chat       # correctness benchmark
 llama-choose stop                   # stop active servers

@@ -21,6 +21,7 @@ mod meta;
 mod score;
 mod tui;
 
+use std::io::Read;
 use std::process::Command;
 
 use config::Model;
@@ -53,6 +54,7 @@ fn main() {
     let code = match args.get(1).map(String::as_str) {
         None => interactive(),
         Some("stats") => cmd_stats(),
+        Some("check") => cmd_check(args.get(2)),
         Some("bench") => cmd_bench(args.get(2), args.get(3)),
         Some("launch") => cmd_launch(args.get(2), args.get(3)),
         Some("stop") => cmd_stop(),
@@ -75,8 +77,9 @@ fn print_help() {
          usage:\n  \
          llama-choose          interactive model picker (default)\n  \
          llama-choose stats    print the usage / tokens-per-second table\n  \
+         llama-choose check [ALIAS]\n                       validate model files without launching anything\n  \
          llama-choose bench ALIAS|all [chat|code]\n                       run dynamic correctness benchmarks via the router\n  \
-         llama-choose launch ALIAS [server|phone|shared|cli]\n                       launch one model non-interactively (default: server)\n  \
+         llama-choose launch ALIAS [tools|server|phone|shared|cli]\n                       launch one model non-interactively (default: tools)\n  \
          llama-choose stop     stop the running inference server\n  \
          llama-choose -h       show this help\n\n\
          configured models are read from ~/.local/share/llama-models.ini\n\
@@ -315,6 +318,10 @@ fn run_tui(
 
     let actions = vec![
         (
+            "tools".to_string(),
+            "Start llama-server with built-in tools (127.0.0.1:3002)".to_string(),
+        ),
+        (
             "server".to_string(),
             "Start llama-server (127.0.0.1:3002)".to_string(),
         ),
@@ -363,7 +370,7 @@ fn run_tui(
                 });
             }
             _ => {
-                // server / phone / shared / cli all pick a single GGUF model.
+                // tools / server / phone / shared / cli all pick a single GGUF model.
                 return Ok(match tui::pick_model(term, views)? {
                     Some(index) => Decision::Launch { mode, index },
                     None => Decision::Quit,
@@ -392,15 +399,166 @@ fn tailscale_ip() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Confirm the model file (and mmproj/MTP drafter, if any) exist before we
-/// bother spawning.
-fn require_files(m: &Model) -> Result<(), String> {
-    for key in ["model", "model-draft", "mmproj"] {
-        if let Some(p) = m.get(key) {
-            if !std::path::Path::new(p).is_file() {
-                return Err(format!("missing {key} file: {p}"));
-            }
+const GGUF_HEADER_LEN: u64 = 24;
+const MIN_GGUF_VERSION: u32 = 2;
+const MAX_GGUF_VERSION: u32 = 3;
+const MAX_SPLIT_SHARDS: u32 = 1000;
+
+fn read_gguf_header(path: &std::path::Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("cannot stat GGUF file {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "GGUF path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    if metadata.len() < GGUF_HEADER_LEN {
+        return Err(format!(
+            "truncated GGUF header ({} bytes): {}",
+            metadata.len(),
+            path.display()
+        ));
+    }
+    if metadata.len() == GGUF_HEADER_LEN {
+        return Err(format!(
+            "GGUF file is header-only ({} bytes): {}",
+            metadata.len(),
+            path.display()
+        ));
+    }
+
+    let mut header = [0u8; GGUF_HEADER_LEN as usize];
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open GGUF file {}: {e}", path.display()))?;
+    file.read_exact(&mut header)
+        .map_err(|e| format!("truncated GGUF header in {}: {e}", path.display()))?;
+    if &header[..4] != b"GGUF" {
+        return Err(format!("invalid GGUF magic: {}", path.display()));
+    }
+
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if !(MIN_GGUF_VERSION..=MAX_GGUF_VERSION).contains(&version) {
+        return Err(format!(
+            "unsupported GGUF version {version} (llama.cpp supports v{MIN_GGUF_VERSION}-v{MAX_GGUF_VERSION}) in {}",
+            path.display()
+        ));
+    }
+    let tensors = i64::from_le_bytes(header[8..16].try_into().unwrap());
+    if tensors <= 0 {
+        return Err(format!("GGUF has no tensors: {}", path.display()));
+    }
+    let n_kv = i64::from_le_bytes(header[16..24].try_into().unwrap());
+    if n_kv < 0 {
+        return Err(format!(
+            "GGUF has an invalid metadata count in {}",
+            path.display()
+        ));
+    }
+    let minimum_len = 24u128 + tensors as u128 * 24 + n_kv as u128 * 13;
+    if minimum_len > metadata.len() as u128 {
+        return Err(format!(
+            "GGUF file is too short for its header counts ({} bytes; at least {minimum_len}): {}",
+            metadata.len(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Return every expected shard for a filename such as `model-00001-of-00002.gguf`.
+fn split_shards(path: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(vec![path.to_path_buf()]);
+    };
+    let Some((before_total, total_text)) = stem.rsplit_once("-of-") else {
+        return Ok(vec![path.to_path_buf()]);
+    };
+    let Some((prefix, shard_text)) = before_total.rsplit_once('-') else {
+        return Ok(vec![path.to_path_buf()]);
+    };
+    if shard_text.len() != 5
+        || total_text.len() != 5
+        || !shard_text.bytes().all(|b| b.is_ascii_digit())
+        || !total_text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let shard: u32 = shard_text.parse().unwrap();
+    let total: u32 = total_text.parse().unwrap();
+    if total == 0 || shard == 0 || shard > total {
+        return Err(format!("invalid GGUF shard numbering: {}", path.display()));
+    }
+    if total > MAX_SPLIT_SHARDS {
+        return Err(format!(
+            "GGUF shard count {total} is unreasonable: {}",
+            path.display()
+        ));
+    }
+
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("gguf");
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    Ok((1..=total)
+        .map(|n| parent.join(format!("{prefix}-{n:05}-of-{total:05}.{extension}")))
+        .collect())
+}
+
+fn validate_gguf(key: &str, path: &str) -> Result<(), String> {
+    let path = std::path::Path::new(path);
+    for shard in split_shards(path)? {
+        if !shard.is_file() {
+            return Err(format!(
+                "missing {key} shard (expected {}): {}",
+                shard.display(),
+                path.display()
+            ));
         }
+        read_gguf_header(&shard)?;
+    }
+    Ok(())
+}
+
+fn validate_template(path: &str) -> Result<(), String> {
+    let path = std::path::Path::new(path);
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("cannot stat chat-template-file {}: {e}", path.display()))?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(format!(
+            "chat-template-file is missing or empty: {}",
+            path.display()
+        ));
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("cannot read chat-template-file {}: {e}", path.display()))?;
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte)
+        .map_err(|e| format!("cannot read chat-template-file {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn artifact_paths(m: &Model) -> impl Iterator<Item = (&'static str, &str)> {
+    ["model", "model-draft", "mmproj", "chat-template-file"]
+        .into_iter()
+        .filter_map(|key| m.get(key).map(|path| (key, path)))
+}
+
+/// Confirm model files, split siblings, and optional template are usable before
+/// spawning. This is a bounded header check; it does not hash or fully parse GGUF.
+fn require_files(m: &Model) -> Result<(), String> {
+    let Some(model) = m.get("model") else {
+        return Err(format!("missing model path for alias {}", m.alias));
+    };
+    for (key, path) in artifact_paths(m) {
+        if key == "chat-template-file" {
+            validate_template(path)?;
+        } else {
+            validate_gguf(key, path)?;
+        }
+    }
+    // Keep the mandatory model check explicit even if the artifact iterator is
+    // changed later.
+    if model.is_empty() {
+        return Err(format!("empty model path for alias {}", m.alias));
     }
     Ok(())
 }
@@ -421,7 +579,7 @@ fn launch_model(m: &Model, mode: &str, conn: Option<&Connection>) -> i32 {
     }
 
     let (host, parallel) = match mode {
-        "server" => ("127.0.0.1".to_string(), 1),
+        "tools" | "server" => ("127.0.0.1".to_string(), 1),
         "phone" | "shared" => match tailscale_ip() {
             Some(ip) => (ip, if mode == "shared" { 2 } else { 1 }),
             None => {
@@ -435,7 +593,7 @@ fn launch_model(m: &Model, mode: &str, conn: Option<&Connection>) -> i32 {
         }
     };
 
-    let cmd = launch::build_server_command(m, &host, SERVER_PORT, parallel);
+    let cmd = launch::build_server_command(m, &host, SERVER_PORT, parallel, mode == "tools");
     if let Some(c) = conn {
         let _ = db::record_launch(c, &m.stats_key, mode);
     }
@@ -628,16 +786,69 @@ fn cmd_stats() -> i32 {
     0
 }
 
+/// Check configured model artifacts without launching or hashing them.
+fn cmd_check(alias: Option<&String>) -> i32 {
+    let models = match config::parse(&config::default_ini_path()) {
+        Ok(models) => models,
+        Err(e) => {
+            eprintln!("llama-choose: {e}");
+            return 1;
+        }
+    };
+    let selected: Vec<&Model> = if let Some(alias) = alias {
+        match models.iter().find(|m| &m.alias == alias) {
+            Some(model) => vec![model],
+            None => {
+                eprintln!("llama-choose: unknown configured model alias '{alias}'");
+                return 1;
+            }
+        }
+    } else {
+        models.iter().collect()
+    };
+
+    let mut failed = 0u32;
+    println!(
+        "Checking {} configured model(s) (metadata/header only)",
+        selected.len()
+    );
+    for model in &selected {
+        let result = require_files(model);
+        println!(
+            "\n{}: {}",
+            model.alias,
+            if result.is_ok() { "OK" } else { "FAIL" }
+        );
+        for (key, path) in artifact_paths(model) {
+            println!("  {key}: {path}");
+        }
+        if let Err(error) = result {
+            failed += 1;
+            println!("  error: {error}");
+        }
+    }
+    println!(
+        "\nSummary: {} passed, {} failed; no checksum or full tensor validation performed",
+        selected.len() as u32 - failed,
+        failed
+    );
+    if failed == 0 {
+        0
+    } else {
+        1
+    }
+}
+
 /// Launch one model by alias without the TUI, e.g. from a script or tmux.
 /// Uses the exact same launch path as the picker, so stats still accrue.
 fn cmd_launch(alias: Option<&String>, mode: Option<&String>) -> i32 {
     let Some(alias) = alias else {
-        eprintln!("usage: llama-choose launch ALIAS [server|phone|shared|cli]");
+        eprintln!("usage: llama-choose launch ALIAS [tools|server|phone|shared|cli]");
         return 2;
     };
-    let mode = mode.map(String::as_str).unwrap_or("server");
-    if !matches!(mode, "server" | "phone" | "shared" | "cli") {
-        eprintln!("llama-choose: launch mode must be server, phone, shared, or cli");
+    let mode = mode.map(String::as_str).unwrap_or("tools");
+    if !matches!(mode, "tools" | "server" | "phone" | "shared" | "cli") {
+        eprintln!("llama-choose: launch mode must be tools, server, phone, shared, or cli");
         return 2;
     }
 
@@ -742,4 +953,127 @@ fn cmd_bench(alias: Option<&String>, suite: Option<&String>) -> i32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "llama-choose-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn write_header(path: &Path, len: usize) {
+        let mut bytes = vec![0u8; len];
+        if len >= GGUF_HEADER_LEN as usize {
+            bytes[..4].copy_from_slice(b"GGUF");
+            bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+            bytes[8..16].copy_from_slice(&1u64.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_minimal_gguf(path: &Path) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one tensor
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no metadata
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // name length
+        bytes.push(b'x');
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // one dimension
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one element
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // F32
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor data offset
+        while bytes.len() % 32 != 0 {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn model(path: &Path, extras: &[(&str, &str)]) -> Model {
+        let mut kv = vec![("model".into(), path.display().to_string())];
+        kv.extend(
+            extras
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into())),
+        );
+        Model {
+            alias: "test-model".into(),
+            kv,
+            desc: None,
+            configured: true,
+            stats_key: "test-model".into(),
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_and_header_only_gguf() {
+        let root = temp_root("truncated");
+        std::fs::create_dir_all(&root).unwrap();
+        let truncated = root.join("truncated.gguf");
+        write_header(&truncated, 4);
+        assert!(require_files(&model(&truncated, &[]))
+            .unwrap_err()
+            .contains("truncated GGUF header"));
+
+        let header_only = root.join("header-only.gguf");
+        write_header(&header_only, GGUF_HEADER_LEN as usize);
+        assert!(require_files(&model(&header_only, &[]))
+            .unwrap_err()
+            .contains("header-only"));
+
+        let header_plus_one = root.join("header-plus-one.gguf");
+        write_header(&header_plus_one, GGUF_HEADER_LEN as usize + 1);
+        assert!(require_files(&model(&header_plus_one, &[]))
+            .unwrap_err()
+            .contains("too short for its header counts"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_magic_and_missing_shard() {
+        let root = temp_root("shards");
+        std::fs::create_dir_all(&root).unwrap();
+        let invalid = root.join("invalid.gguf");
+        write_header(&invalid, 25);
+        std::fs::write(&invalid, vec![0u8; 25]).unwrap();
+        assert!(require_files(&model(&invalid, &[]))
+            .unwrap_err()
+            .contains("invalid GGUF magic"));
+
+        let first = root.join("split-00001-of-00002.gguf");
+        write_minimal_gguf(&first);
+        assert!(require_files(&model(&first, &[]))
+            .unwrap_err()
+            .contains("missing model shard"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepts_valid_gguf_and_rejects_missing_template() {
+        let root = temp_root("template");
+        std::fs::create_dir_all(&root).unwrap();
+        let model_path = root.join("existing-model.gguf");
+        write_minimal_gguf(&model_path);
+        assert!(require_files(&model(&model_path, &[])).is_ok());
+
+        let missing_template = root.join("missing.jinja");
+        assert!(require_files(&model(
+            &model_path,
+            &[("chat-template-file", missing_template.to_str().unwrap())]
+        ))
+        .unwrap_err()
+        .contains("chat-template-file"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -54,9 +54,22 @@ pub fn build_load_args(model: &Model) -> Vec<String> {
 }
 
 /// `llama-server` command for a single model in a server-style mode.
-pub fn build_server_command(model: &Model, host: &str, port: u16, parallel: u32) -> Vec<String> {
+///
+/// The tools mode enables every built-in llama.cpp tool. It is intentionally
+/// explicit so ordinary server launches do not gain shell/file capabilities by
+/// accident.
+pub fn build_server_command(
+    model: &Model,
+    host: &str,
+    port: u16,
+    parallel: u32,
+    tools: bool,
+) -> Vec<String> {
     let mut cmd = vec![resolve_bin("llama-server")];
     cmd.extend(build_load_args(model));
+    if tools {
+        cmd.extend(["--tools".into(), "all".into()]);
+    }
     cmd.extend([
         "--alias".into(),
         model.alias.clone(),
@@ -285,6 +298,22 @@ mod tests {
     #[test]
     fn ignores_unrelated_lines() {
         assert!(parse_timing_line("main: server is listening on http://127.0.0.1:3002").is_none());
+    }
+
+    #[test]
+    fn tools_server_enables_all_builtin_tools() {
+        let model = Model {
+            alias: "test-model".into(),
+            kv: vec![("model".into(), "/tmp/test.gguf".into())],
+            desc: None,
+            configured: true,
+            stats_key: "test-model".into(),
+        };
+        let tools_cmd = build_server_command(&model, "127.0.0.1", 3002, 1, true);
+        assert!(tools_cmd.windows(2).any(|pair| pair == ["--tools", "all"]));
+
+        let plain_cmd = build_server_command(&model, "127.0.0.1", 3002, 1, false);
+        assert!(!plain_cmd.iter().any(|arg| arg == "--tools"));
     }
 
     #[test]
