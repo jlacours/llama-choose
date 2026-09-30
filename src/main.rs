@@ -77,7 +77,7 @@ fn print_help() {
          usage:\n  \
          llama-choose          interactive model picker (default)\n  \
          llama-choose stats    print the usage / tokens-per-second table\n  \
-         llama-choose check [ALIAS]\n                       validate model files without launching anything\n  \
+         llama-choose check [ALIAS]\n                       validate model files (all: also parse the preset\n                       with a throwaway router that loads no weights)\n  \
          llama-choose bench ALIAS|all [chat|code]\n                       run dynamic correctness benchmarks via the router\n  \
          llama-choose launch ALIAS [tools|server|phone|shared|cli]\n                       launch one model non-interactively (default: tools)\n  \
          llama-choose stop     stop the running inference server\n  \
@@ -827,11 +827,37 @@ fn cmd_check(alias: Option<&String>) -> i32 {
             println!("  error: {error}");
         }
     }
-    println!(
-        "\nSummary: {} passed, {} failed; no checksum or full tensor validation performed",
+    let mut summary = format!(
+        "{} passed, {} failed",
         selected.len() as u32 - failed,
         failed
     );
+
+    // The preset parser is whole-file (one bad section aborts the router), so
+    // only the full check runs it; an alias check stays about that model.
+    if alias.is_none() {
+        let ini = config::default_ini_path().display().to_string();
+        let aliases: Vec<&str> = models.iter().map(|m| m.alias.as_str()).collect();
+        print!("\nrouter preset (llama-server --no-models-autoload): ");
+        match launch::validate_router_preset(&ini, &aliases) {
+            Ok(n) => {
+                println!("OK");
+                println!(
+                    "  {n} model(s) listed, all {} sections accepted",
+                    aliases.len()
+                );
+                summary.push_str("; router preset OK");
+            }
+            Err(error) => {
+                failed += 1;
+                println!("FAIL");
+                println!("  error: {error}");
+                summary.push_str("; router preset FAILED");
+            }
+        }
+    }
+
+    println!("\nSummary: {summary}; no checksum or full tensor validation performed");
     if failed == 0 {
         0
     } else {

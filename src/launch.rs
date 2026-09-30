@@ -7,9 +7,13 @@
 //! `exec()` into them and hand the process table straight over, exactly like
 //! the old bash `exec`.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::config::Model;
 use crate::db;
@@ -161,6 +165,139 @@ pub fn exec_replace(env: &[(String, String)], cmd: &[String]) -> ! {
     let err = c.exec(); // only returns on failure
     eprintln!("llama-choose: failed to exec {}: {err}", cmd[0]);
     std::process::exit(127);
+}
+
+/// How long a throwaway preset-check router gets to come up.
+const PRESET_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Kills and reaps the throwaway router however the check ends.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Validate the preset file the way router mode will read it.
+///
+/// llama.cpp's preset parser is stricter than the CLI and aborts the whole
+/// router on the first unknown key, so a llama.cpp update can break router
+/// mode while every model file still looks fine. This starts the exact router
+/// command on a free loopback port with `--no-models-autoload` (no weights
+/// are loaded), waits for `/models`, checks that every `expected` alias is
+/// listed, and always kills the router. Returns the number of listed models.
+pub fn validate_router_preset(ini_path: &str, expected: &[&str]) -> Result<usize, String> {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map_err(|e| format!("cannot reserve a loopback port: {e}"))?
+        .port();
+    let mut cmd = build_router_command(ini_path, "127.0.0.1", port, 1);
+    cmd.push("--no-models-autoload".into());
+
+    let mut child = Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run {}: {e}", cmd[0]))?;
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let mut guard = ChildGuard(child);
+
+    // Drain stderr on a thread so the router never blocks on a full pipe.
+    let log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&log);
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push(line);
+        }
+    });
+
+    let started = Instant::now();
+    loop {
+        if let Ok(Some(status)) = guard.0.try_wait() {
+            // Give the reader a moment to collect the final error line.
+            thread::sleep(Duration::from_millis(100));
+            let lines = log.lock().unwrap();
+            return Err(format!(
+                "router exited ({status}): {}",
+                router_error_summary(&lines)
+            ));
+        }
+        if let Some(body) = http_get(port, "/models") {
+            let ids = parse_model_ids(&body)?;
+            let missing: Vec<&str> = expected
+                .iter()
+                .copied()
+                .filter(|alias| !ids.iter().any(|id| id == alias))
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!("router does not list: {}", missing.join(", ")));
+            }
+            return Ok(ids.len());
+        }
+        if started.elapsed() > PRESET_CHECK_TIMEOUT {
+            return Err(format!(
+                "router did not answer /models within {}s",
+                PRESET_CHECK_TIMEOUT.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Minimal HTTP GET against the loopback router; `Some(body)` only on 200.
+fn http_get(port: u16, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    let status_ok = head
+        .lines()
+        .next()
+        .is_some_and(|l| l.split_whitespace().nth(1) == Some("200"));
+    status_ok.then(|| body.to_string())
+}
+
+/// Model ids from a router `/models` response body.
+fn parse_model_ids(body: &str) -> Result<Vec<String>, String> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("bad /models response: {e}"))?;
+    Ok(json["data"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// The most useful line of a failed router's stderr: its last error line,
+/// else its last line.
+fn router_error_summary(lines: &[String]) -> String {
+    lines
+        .iter()
+        .rev()
+        .find(|l| l.contains(" E ") || l.to_lowercase().contains("error"))
+        .or_else(|| lines.last())
+        // Drop the `0.00.238.189 E ` timestamp/level prefix when present.
+        .map(|l| {
+            l.split_once(" E ")
+                .map_or(l.as_str(), |(_, msg)| msg)
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_else(|| "no output".into())
 }
 
 /// Pull the `tokens per second` value out of a llama-server timing line.
@@ -357,5 +494,32 @@ mod tests {
         assert!((s.pp_avg.unwrap() - 100.0).abs() < 1e-6);
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn router_error_summary_prefers_last_error_line_without_prefix() {
+        let lines = vec![
+            "0.00.149.390 I cmn  common_param: verbosity = 3".to_string(),
+            "0.00.238.189 E srv  llama_server: failed to initialize router models: option 'no-mmap' not recognized in preset 'gemma'".to_string(),
+            "0.00.240.000 I srv  shutting down".to_string(),
+        ];
+        assert_eq!(
+            router_error_summary(&lines),
+            "srv  llama_server: failed to initialize router models: option 'no-mmap' not recognized in preset 'gemma'"
+        );
+        assert_eq!(
+            router_error_summary(&["just this".to_string()]),
+            "just this"
+        );
+        assert_eq!(router_error_summary(&[]), "no output");
+    }
+
+    #[test]
+    fn parses_router_model_ids() {
+        let body =
+            r#"{"object":"list","data":[{"id":"a","status":{"value":"unloaded"}},{"id":"b"}]}"#;
+        assert_eq!(parse_model_ids(body).unwrap(), ["a", "b"]);
+        assert!(parse_model_ids("{}").unwrap().is_empty());
+        assert!(parse_model_ids("not json").is_err());
     }
 }

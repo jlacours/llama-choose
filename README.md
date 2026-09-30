@@ -22,11 +22,16 @@ Models are read from `~/.local/share/llama-models.ini`. The optional llama.cpp w
 Router mode in the picker enables all built-in llama.cpp tools for every model,
 matching single-model tools mode (including shell and file tools).
 
+`llama-choose check` without an alias also parses the preset the way router
+mode does: it starts a throwaway router on a free loopback port with
+`--no-models-autoload` (no weights are loaded), so a llama.cpp update that
+rejects a preset key shows up before router mode fails to start.
+
 ```bash
 llama-choose                        # interactive picker
 llama-choose launch ALIAS tools     # launch one model with built-in tools
 llama-choose launch ALIAS server    # launch one model without built-in tools
-llama-choose check [ALIAS]          # validate model headers and split files
+llama-choose check [ALIAS]          # validate model headers, split files, and the router preset
 llama-choose stats                  # usage and throughput
 llama-choose bench ALIAS chat       # correctness benchmark
 llama-choose stop                   # stop active servers
