@@ -19,6 +19,9 @@ The installer builds with Cargo and copies `llama-choose` to `~/.local/bin`. A l
 
 Models are read from `~/.local/share/llama-models.ini`. The optional llama.cpp web UI configuration is read from `~/.config/llama.cpp/ui-config.json`.
 
+Router mode in the picker enables all built-in llama.cpp tools for every model,
+matching single-model tools mode (including shell and file tools).
+
 ```bash
 llama-choose                        # interactive picker
 llama-choose launch ALIAS tools     # launch one model with built-in tools

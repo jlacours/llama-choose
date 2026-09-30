@@ -55,9 +55,8 @@ pub fn build_load_args(model: &Model) -> Vec<String> {
 
 /// `llama-server` command for a single model in a server-style mode.
 ///
-/// The tools mode enables every built-in llama.cpp tool. It is intentionally
-/// explicit so ordinary server launches do not gain shell/file capabilities by
-/// accident.
+/// The tools mode enables every built-in llama.cpp tool, as does router mode.
+/// Ordinary server launches do not enable these tools.
 pub fn build_server_command(
     model: &Model,
     host: &str,
@@ -89,7 +88,8 @@ pub fn build_server_command(
     cmd
 }
 
-/// `llama-server` router mode: serve every model in the preset file.
+/// `llama-server` router mode: serve every model with built-in tools.
+/// llama.cpp overlays these router options onto each child model's preset.
 pub fn build_router_command(ini_path: &str, host: &str, port: u16, parallel: u32) -> Vec<String> {
     vec![
         resolve_bin("llama-server"),
@@ -107,6 +107,8 @@ pub fn build_router_command(ini_path: &str, host: &str, port: u16, parallel: u32
         ui_config_file(),
         "--parallel".into(),
         parallel.to_string(),
+        "--tools".into(),
+        "all".into(),
     ]
 }
 
@@ -301,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_server_enables_all_builtin_tools() {
+    fn tools_server_and_router_enable_all_builtin_tools() {
         let model = Model {
             alias: "test-model".into(),
             kv: vec![("model".into(), "/tmp/test.gguf".into())],
@@ -311,6 +313,9 @@ mod tests {
         };
         let tools_cmd = build_server_command(&model, "127.0.0.1", 3002, 1, true);
         assert!(tools_cmd.windows(2).any(|pair| pair == ["--tools", "all"]));
+
+        let router_cmd = build_router_command("/tmp/models.ini", "127.0.0.1", 3099, 1);
+        assert!(router_cmd.windows(2).any(|pair| pair == ["--tools", "all"]));
 
         let plain_cmd = build_server_command(&model, "127.0.0.1", 3002, 1, false);
         assert!(!plain_cmd.iter().any(|arg| arg == "--tools"));

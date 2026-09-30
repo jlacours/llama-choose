@@ -327,7 +327,7 @@ fn run_tui(
         ),
         (
             "router".to_string(),
-            "Start llama-server router mode (all models)".to_string(),
+            "Start llama-server router mode (all models, built-in tools)".to_string(),
         ),
         ("vllm".to_string(), "Start vLLM OpenAI server".to_string()),
         (
